@@ -1,8 +1,8 @@
 import base64
 import socket
 import struct
-import _thread
 import io
+import threading
 import time
 
 import requests
@@ -19,11 +19,13 @@ server_socket.listen(5)
 BUFFER_SIZE = 1024 * 60
 apiKey = "HelloWorld"
 
-BASE_IMAGE_PATH = "images/"
 SOCKET_TIME_OUT = 10
-# HEADER_SIZE = struct.calcsize('10si10s')
-# print(str(HEADER_SIZE).center(100, '-'))
 payload_size = struct.calcsize(">L")
+
+frametosend: None | np.ndarray = None
+isupdatedframe = False
+senderIsStillAlive = True
+receiverIsStillAlive = True
 
 response = requests.get("http://localhost:8089/employer")  # local server to load data from the server
 
@@ -31,15 +33,11 @@ if response.status_code != 200:
     raise Exception('Problem')
 
 human_list: list[Human] = []
-
-print(response.json())
 for human in response.json():
     human['face_coding_employer'] = np.array(human['face_coding_employer'], dtype=np.float64)
     human_list.append(Human(**human))
 
 face_codding_list = list(map(lambda human_: human_.face_coding_employer, human_list))
-
-print(face_codding_list)
 
 
 # load info from database
@@ -63,11 +61,12 @@ def load(img: bytes):
     """
     data__ = np.frombuffer(img, dtype=np.int8)
     frame = cv2.imdecode(data__, cv2.IMREAD_COLOR)
-    frame_ = cv2.rotate(frame, cv2.ROTATE_180)
-    return frame_
+    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 
 clients = []
+boardsClients = []
 
 
 # def requestHandler(conn, address):
@@ -89,33 +88,34 @@ clients = []
 #         data = data[msg_size:]
 
 
-def process_frame(frame):
-    pass
-
-
-def sendFrame(frame, size):
-    # broadcast the stream to clients
-    for i in clients:
-        try:
-            isRe, _ = cv2.imencode(".jpg", frame)
-            i.write(len(_).to_bytes(4, byteorder='big'))
-            i.write(_)
-        except BrokenPipeError as e:
-            print("Client Disconnected")
-            clients.remove(i)
+# def sendFrameToBoard(frame):
+#     # broadcast the stream to clients
+#     frame_res = cv2.resize(frame, (100, 130))
+#     for i in boardsClients:
+#         try:
+#             isRe, image_ = cv2.imencode(".jpg", frame_res)
+#             i.sendall(len(image_).to_bytes(4, byteorder='little'))
+#             i.sendall(image_)
+#         except BrokenPipeError as e:
+#             print("Client Disconnected")
+#             if i in boardsClients:
+#                 boardsClients.remove(i)
 
 
 def streamerHandler(streamer_socket: socket.socket, streamer_address):
     new_time = time.time()
     last_time_enter = new_time
+    global isupdatedframe
+    global frametosend
+    global senderIsStillAlive
     try:
         file_from_socket = streamer_socket.makefile("rb")
 
-        while True:
+        while senderIsStillAlive:
             new_time = time.time()
             packed_size = file_from_socket.read(payload_size)
             if not packed_size:
-                break  # Connection closed
+                senderIsStillAlive = False
 
             size = struct.unpack('<L', packed_size)[0]
             if size == 0:
@@ -126,8 +126,7 @@ def streamerHandler(streamer_socket: socket.socket, streamer_address):
             frame_data = buffer.getvalue()
             frame = load(frame_data)
             if frame is None:
-                break
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+                senderIsStillAlive = False
             small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
 
             current_image_2_encode = face_recognition.face_encodings(small_frame)
@@ -140,6 +139,9 @@ def streamerHandler(streamer_socket: socket.socket, streamer_address):
                                                          face_to_compare=encoded_face)
                 min_match = min(matches)
                 left *= 2
+                right *= 2
+                bottom *= 2
+                top *= 2                left *= 2
                 right *= 2
                 bottom *= 2
                 top *= 2
@@ -173,7 +175,9 @@ def streamerHandler(streamer_socket: socket.socket, streamer_address):
                     cv2.putText(frame, "unknown", (left + 6, bottom - 6), font,
                                 1.0, (255, 255, 255), 1)
 
-            sendFrame(frame, size)
+            frametosend = frame
+            isupdatedframe = True
+
             cv2.imshow("Received Frame", frame)
 
             buffer.flush()
@@ -186,22 +190,87 @@ def streamerHandler(streamer_socket: socket.socket, streamer_address):
         print(e)
 
 
+def back_ground_sender():
+    global isupdatedframe
+    global frametosend
+    global receiverIsStillAlive
+    while receiverIsStillAlive:
+        if isupdatedframe:
+            isupdatedframe = False
+            for i in clients:
+                try:
+                    isRe, _ = cv2.imencode(".jpg", frametosend)
+                    i.write(len(_).to_bytes(4, byteorder='big'))
+                    i.write(_)
+                except BrokenPipeError as e:
+                    print("Client Disconnected")
+                    if i in clients:
+                        clients.remove(i)
+
+            frame_res = cv2.resize(frametosend, (120, 160))
+            for i in boardsClients:
+                try:
+                    isRe, image_ = cv2.imencode(".jpg", frame_res)
+                    i.sendall(len(image_).to_bytes(4, byteorder='little'))
+                    i.sendall(image_)
+                except BrokenPipeError as e:
+                    print("Client Disconnected")
+                    if i in boardsClients:
+                        boardsClients.remove(i)
+
+
 def main():
-    print('listing...')
+    print("we are in fucking main")
+
+    threadOfSender = threading.Thread(target=back_ground_sender, args=())
+
+    threadRceivier: threading.Thread | None = None
+    global receiverIsStillAlive
+    global senderIsStillAlive
+
+    print("listing to clients ...")
     while True:
         try:
             socket__, address = server_socket.accept()
-            receivedBytes = socket__.recv(2)
             print(f'There is client at address ${address}')
+            receivedBytes = socket__.recv(2)
+
+            print(f'recived bytes from ${address}')
 
             if receivedBytes == b'CL':
                 clients.append(socket__.makefile('wb'))
+            if receivedBytes == b'CB':
+                boardsClients.append(socket__)
+
+            if receivedBytes == b'CB' or receivedBytes == b'CL':
+                if not threadOfSender.is_alive():
+                    threadOfSender.start()
             elif receivedBytes == b'NC':
-                _thread.start_new_thread(streamerHandler, (socket__, address))
+                if threadRceivier is None:
+                    threadRceivier = threading.Thread(target=streamerHandler, args=(socket__, address))
+                    threadRceivier.start()
+            else:
+                print("Client Access Deny !")
         except KeyboardInterrupt:
-            pass
+            senderIsStillAlive = False
+            receiverIsStillAlive = False
+            if threadOfSender.is_alive():
+                threadOfSender.join()
+
+            if threadRceivier is not None and threadRceivier.is_alive():
+                threadRceivier.join()
+
+            server_socket.close()
+
         except Exception as e:
-            print(e)
+            senderIsStillAlive = False
+            receiverIsStillAlive = False
+            if threadOfSender.is_alive():
+                threadOfSender.join()
+
+            if threadRceivier is not None and threadRceivier.is_alive():
+                threadRceivier.join()
+
             server_socket.close()
 
 
